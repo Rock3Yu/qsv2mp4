@@ -145,6 +145,44 @@ def first_pcr(buf: bytes, sync: int = 0) -> float | None:
     return None
 
 
+def first_pts(buf: bytes, sync: int = 0) -> float | None:
+    """
+    Scan TS packets starting at *sync* and return the first PES presentation
+    timestamp found, in seconds.
+
+    The PCR is the transport clock; the PTS is what the muxer actually writes
+    into the MP4.  They usually agree, but a container assembled from shards can
+    have a tidy PCR and a broken PTS, so both are worth checking.
+    """
+    for i in range(sync, len(buf) - TS_PACKET, TS_PACKET):
+        if buf[i] != 0x47:
+            continue
+        if not (buf[i + 1] & 0x40):        # payload_unit_start_indicator
+            continue
+        afc = (buf[i + 3] >> 4) & 0b11
+        if afc in (0b00, 0b10):            # no payload
+            continue
+        p = i + 4
+        if afc == 0b11:                    # skip the adaptation field
+            p += 1 + buf[i + 4]
+        if p + 14 > i + TS_PACKET:
+            continue
+        if buf[p:p + 3] != b"\x00\x00\x01":
+            continue
+        if not (0xC0 <= buf[p + 3] <= 0xEF):   # audio or video PES only
+            continue
+        if not (buf[p + 7] & 0x80):            # PTS_DTS_flags
+            continue
+        b = buf[p + 9:p + 14]
+        pts = (((b[0] >> 1) & 0x07) << 30 |
+               b[1] << 22 |
+               ((b[2] >> 1) & 0x7F) << 15 |
+               b[3] << 7 |
+               b[4] >> 1)
+        return pts / 90000.0
+    return None
+
+
 def _fmt_clock(sec) -> str:
     if sec is None:
         return "     —      "
@@ -418,28 +456,171 @@ def probe_segments(qsv_path: str, indices, probe_bytes: int = 1 << 16):
                 "size":   seg_size,
                 "sync":   sync,
                 "pcr":    first_pcr(buf, sync) if sync >= 0 else None,
+                "pts":    first_pts(buf, sync) if sync >= 0 else None,
             })
     return out
 
 
-def detect_clock_resets(probes) -> list:
+# Byte-value lookup tables so the hot loops stay at C speed.
+_TEI_TABLE = bytes(1 if (i & 0x80) else 0 for i in range(256))
+
+# Annex-B start code followed by a parameter-set NAL header.  MP4 stores these
+# once, in the sample description; MPEG-TS repeats them in-band and lets them
+# change mid-stream.  A stream whose parameter sets differ between segments
+# therefore survives as .ts but loses everything after the first set once it is
+# copied into MP4 — which looks exactly like "the first segment plays, the rest
+# is macroblock soup".
+_PS_PATTERNS = (
+    (b"\x00\x00\x01\x40\x01", "VPS"),      # HEVC, nal_unit_type 32
+    (b"\x00\x00\x01\x42\x01", "SPS"),      # HEVC, nal_unit_type 33
+    (b"\x00\x00\x01\x44\x01", "PPS"),      # HEVC, nal_unit_type 34
+    (b"\x00\x00\x01\x67",     "SPS"),      # H.264, nal_ref_idc 3 + type 7
+    (b"\x00\x00\x01\x68",     "PPS"),      # H.264, nal_ref_idc 3 + type 8
+)
+
+_PS_CAPTURE = 24        # bytes of parameter set to fingerprint
+
+
+def _param_sets(buf: bytes, base: int) -> set:
+    """
+    Fingerprint the parameter sets in *buf*, which starts on a TS packet
+    boundary at absolute offset *base* within its segment.
+
+    Only matches that fit entirely inside one packet payload are taken, so a
+    4-byte TS header never lands in the middle of a fingerprint and makes two
+    identical parameter sets look different.
+    """
+    found = set()
+    for pattern, kind in _PS_PATTERNS:
+        start = 0
+        while True:
+            p = buf.find(pattern, start)
+            if p < 0:
+                break
+            start = p + 1
+            off = p % TS_PACKET
+            if off + len(pattern) + _PS_CAPTURE > TS_PACKET:
+                continue                    # would straddle a packet header
+            blob = buf[p + len(pattern):p + len(pattern) + _PS_CAPTURE]
+            found.add((kind, blob.hex()))
+    return found
+
+
+def scan_segment(src, seg_offset: int, seg_size: int, file_size: int,
+                 pid_sample: int = 40000) -> dict:
+    """
+    Walk one segment packet-by-packet and report transport-level health.
+
+    This is the test that separates "the container was unpacked wrong" from
+    "the payload itself is not clear MPEG-TS".  A segment whose 188-byte sync
+    grid holds from end to end was extracted correctly, whatever the picture
+    looks like afterwards.  A segment that locks on at offset 0 and then loses
+    sync partway through is still encrypted past that point.
+    """
+    CHUNK = TS_PACKET * 8192            # ~1.5 MiB, always whole packets
+
+    avail     = max(0, min(seg_size, file_size - seg_offset))
+    packets    = 0
+    bad_sync   = 0
+    first_bad  = None
+    tei        = 0
+    pids       = {}
+    param_sets = set()
+
+    src.seek(seg_offset)
+    remaining = avail
+    consumed  = 0
+    first     = True
+
+    while remaining >= TS_PACKET:
+        want = min(CHUNK, remaining - (remaining % TS_PACKET))
+        if want < TS_PACKET:
+            break
+        buf = src.read(want)
+        if not buf:
+            break
+        if len(buf) % TS_PACKET:
+            buf = buf[:len(buf) - (len(buf) % TS_PACKET)]
+            if not buf:
+                break
+
+        if first:
+            head = bytearray(buf[:min(HEAD_LEN, len(buf))])
+            _decrypt_2(head)
+            buf = bytes(head) + buf[len(head):]
+            first = False
+
+        syncs = buf[0::TS_PACKET]
+        good  = syncs.count(0x47)
+        n     = len(syncs)
+        packets  += n
+        if good != n:
+            bad = n - good
+            bad_sync += bad
+            if first_bad is None:
+                for k in range(n):
+                    if syncs[k] != 0x47:
+                        first_bad = consumed + k * TS_PACKET
+                        break
+
+        tei += buf[1::TS_PACKET].translate(_TEI_TABLE).count(1)
+        param_sets |= _param_sets(buf, consumed)
+
+        if len(pids) < 64 and consumed // TS_PACKET < pid_sample:
+            b1 = buf[1::TS_PACKET]
+            b2 = buf[2::TS_PACKET]
+            for hi, lo in zip(b1[:pid_sample], b2[:pid_sample]):
+                pid = ((hi & 0x1F) << 8) | lo
+                pids[pid] = pids.get(pid, 0) + 1
+
+        consumed  += len(buf)
+        remaining -= len(buf)
+
+    return {
+        "packets":    packets,
+        "bad_sync":   bad_sync,
+        "first_bad":  first_bad,
+        "tei":        tei,
+        "pids":       pids,
+        "param_sets": param_sets,
+        "scanned":    consumed,
+        "size":       seg_size,
+    }
+
+
+def detect_clock_resets(probes, key: str = "pcr") -> list:
     """
     Return the segment numbers whose clock fails to advance past the previous
     segment's.  On one shared timeline every segment starts strictly later than
-    the one before it, so a PCR that stalls or moves backwards means the shards
-    are independent transport streams — splicing those byte-wise yields
+    the one before it, so a clock that stalls or moves backwards means the
+    shards are independent transport streams — splicing those byte-wise yields
     non-monotonic timestamps.
+
+    *key* selects which clock to test: "pcr" (transport) or "pts" (what the
+    muxer writes).  They can disagree, and a clean PCR does not imply a clean
+    PTS, so both are checked.
     """
     resets = []
     prev = None
     for p in probes:
-        pcr = p["pcr"]
-        if pcr is None:
+        t = p.get(key)
+        if t is None:
             continue
-        if prev is not None and pcr <= prev:
+        if prev is not None and t <= prev:
             resets.append(p["n"])
-        prev = pcr
+        prev = t
     return resets
+
+
+def detect_any_resets(probes) -> tuple:
+    """Return (segments, which_clock) for whichever clock looks discontinuous."""
+    pcr = detect_clock_resets(probes, "pcr")
+    if pcr:
+        return pcr, "PCR"
+    pts = detect_clock_resets(probes, "pts")
+    if pts:
+        return pts, "PTS"
+    return [], None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -474,6 +655,21 @@ _FFMPEG_RED_FLAGS = (
 _SEVERE_LABELS = {label for _, label, severe in _FFMPEG_RED_FLAGS if severe}
 
 
+def _generalise(line: str) -> str:
+    """Collapse a log line to a shape, so repeats with different numbers group."""
+    out = []
+    prev_digit = False
+    for ch in line:
+        if ch.isdigit():
+            if not prev_digit:
+                out.append("#")
+            prev_digit = True
+        else:
+            out.append(ch)
+            prev_digit = False
+    return "".join(out)
+
+
 def _summarise_ffmpeg(stderr: str) -> dict:
     """Count the stderr lines that mean 'exit 0, but look closer'."""
     counts = {}
@@ -501,8 +697,17 @@ def _run_ffmpeg(cmd, verbose: bool):
 
     flags = _summarise_ffmpeg(err)
     if verbose:
-        for line in err.strip().splitlines()[-5:]:
-            print("  ", line)
+        # Showing only the tail hides the decoder complaints that explain a bad
+        # picture, so collapse repeats instead of truncating: one line per
+        # distinct message, with a count.
+        seen = {}
+        for line in err.strip().splitlines():
+            key = _generalise(line)
+            entry = seen.setdefault(key, [0, line])
+            entry[0] += 1
+        for count, sample in seen.values():
+            suffix = f"   (×{count:,})" if count > 1 else ""
+            print("  ", sample.strip() + suffix)
     return True, flags
 
 
@@ -618,10 +823,10 @@ def convert_one(qsv_path: str,
               f"— the .qsv download is incomplete")
 
     # ── Decide how to mux ────────────────────────────────────────────────────
-    resets = []
+    resets, clock = [], None
     if seg_count > 1 and mux_mode in ("auto", "concat"):
         probes = probe_segments(qsv_path, indices)
-        resets = detect_clock_resets(probes)
+        resets, clock = detect_any_resets(probes)
         bad_sync = [p["n"] for p in probes if p["sync"] != 0]
         if bad_sync:
             print(f"  [WARN] segment(s) {bad_sync} do not start with an MPEG-TS "
@@ -629,7 +834,7 @@ def convert_one(qsv_path: str,
 
     use_concat = (mux_mode == "concat") or (mux_mode == "auto" and bool(resets))
     if resets:
-        print(f"  [note] clock resets at segment(s) {resets} "
+        print(f"  [note] {clock} resets at segment(s) {resets} "
               f"— each shard has its own timeline")
     if use_concat and seg_count > 1:
         print("  Strategy: per-segment extract + ffmpeg concat demuxer")
@@ -677,11 +882,22 @@ def convert_one(qsv_path: str,
             severe = {l: c for l, c in flags.items() if l in _SEVERE_LABELS}
             minor  = {l: c for l, c in flags.items() if l not in _SEVERE_LABELS}
 
+            # A handful of corrupt packets per segment join is expected — the
+            # continuity counters restart at every splice.  Orders of magnitude
+            # more than that means the payload itself is damaged, so promote it.
+            join_budget = max(32, seg_count * 8)
             for label, count in sorted(minor.items()):
-                print(f"  [info] ffmpeg reported {count:,}× {label} "
-                      f"(normal at segment joins)")
+                if count > join_budget:
+                    severe[label] = count
+                    print(f"  [WARN] ffmpeg reported {count:,}× {label} "
+                          f"— far more than the ~{join_budget} expected from "
+                          f"{seg_count} segment joins; the payload is damaged")
+                else:
+                    print(f"  [info] ffmpeg reported {count:,}× {label} "
+                          f"(normal at segment joins)")
             for label, count in sorted(severe.items()):
-                print(f"  [WARN] ffmpeg reported {count:,}× {label}")
+                if label not in minor:
+                    print(f"  [WARN] ffmpeg reported {count:,}× {label}")
 
             if severe:
                 hint = ("" if use_concat else
@@ -712,7 +928,7 @@ def convert_one(qsv_path: str,
 # Diagnostics
 # ─────────────────────────────────────────────────────────────────────────────
 
-def inspect_qsv(qsv_path: str) -> bool:
+def inspect_qsv(qsv_path: str, deep: bool = True) -> bool:
     """
     Dump the container layout and per-segment TS state without converting
     anything.  This is what to paste into a bug report — it says whether the
@@ -747,8 +963,9 @@ def inspect_qsv(qsv_path: str) -> bool:
     probes = probe_segments(qsv_path, indices)
 
     print(f"\n  {'#':>3}  {'offset':>14}  {'size':>15}  {'gap':>10}  "
-          f"{'sync':>6}  {'first PCR':>13}")
-    print(f"  {'-' * 3}  {'-' * 14}  {'-' * 15}  {'-' * 10}  {'-' * 6}  {'-' * 13}")
+          f"{'sync':>6}  {'first PCR':>13}  {'first PTS':>13}")
+    print(f"  {'-' * 3}  {'-' * 14}  {'-' * 15}  {'-' * 10}  {'-' * 6}  "
+          f"{'-' * 13}  {'-' * 13}")
 
     prev_end = None
     for p in probes:
@@ -757,11 +974,93 @@ def inspect_qsv(qsv_path: str) -> bool:
         sync = "ok" if p["sync"] == 0 else (
             f"@{p['sync']}" if p["sync"] > 0 else "LOST")
         print(f"  {p['n']:>3}  {p['offset']:>14,}  {p['size']:>15,}  {gap:>10}  "
-              f"{sync:>6}  {_fmt_clock(p['pcr'])}")
+              f"{sync:>6}  {_fmt_clock(p['pcr'])}  {_fmt_clock(p['pts'])}")
+
+    # ── Deep scan ────────────────────────────────────────────────────────────
+    scans = []
+    if deep:
+        print(f"\n  Deep scan (walking the 188-byte TS grid of every segment) …",
+              flush=True)
+        t0 = time.time()
+        with open(qsv_path, "rb") as src:
+            file_size = os.fstat(src.fileno()).st_size
+            for _, off, size in indices:
+                scans.append(scan_segment(src, off, size, file_size))
+        print(f"  scanned {sum(s['scanned'] for s in scans) / (1 << 20):.0f} MB "
+              f"in {time.time() - t0:.1f}s\n")
+
+        print(f"  {'#':>3}  {'packets':>12}  {'sync errors':>13}  "
+              f"{'first bad @':>14}  {'TEI':>8}  {'PIDs':>5}  {'param sets':>10}")
+        print(f"  {'-' * 3}  {'-' * 12}  {'-' * 13}  {'-' * 14}  "
+              f"{'-' * 8}  {'-' * 5}  {'-' * 10}")
+        for p, s in zip(probes, scans):
+            pct = (s["bad_sync"] / s["packets"] * 100) if s["packets"] else 0
+            errs = ("clean" if not s["bad_sync"]
+                    else f"{s['bad_sync']:,} ({pct:.1f}%)")
+            fb = "—" if s["first_bad"] is None else f"{s['first_bad']:,}"
+            print(f"  {p['n']:>3}  {s['packets']:>12,}  {errs:>13}  "
+                  f"{fb:>14}  {s['tei']:>8,}  {len(s['pids']):>5}  "
+                  f"{len(s['param_sets']):>10}")
+
+        # Which segments introduce a parameter set the first one never had?
+        base_ps = scans[0]["param_sets"]
+        drift = [p["n"] for p, s in zip(probes[1:], scans[1:])
+                 if s["param_sets"] - base_ps]
+        if drift:
+            print(f"\n  Parameter sets introduced after segment 1: "
+                  f"segment(s) {drift}")
 
     # ── Verdict ──────────────────────────────────────────────────────────────
     print("\n  Findings:")
     findings = []
+
+    if scans:
+        broken = [p["n"] for p, s in zip(probes, scans) if s["bad_sync"]]
+        clean  = [p["n"] for p, s in zip(probes, scans) if not s["bad_sync"]]
+        if broken and clean:
+            findings.append(
+                f"segment(s) {clean} keep TS sync end-to-end but segment(s) "
+                f"{broken} lose it partway — those segments are still "
+                f"encrypted/damaged beyond their 1024-byte head, which no "
+                f"amount of re-muxing can fix"
+            )
+        elif broken:
+            findings.append(
+                f"every segment loses TS sync partway through — the payload is "
+                f"not clear MPEG-TS past the descrambled head"
+            )
+        else:
+            findings.append(
+                "all segments hold TS sync end-to-end — extraction is byte-exact, "
+                "so any playback fault is inside the elementary stream (codec "
+                "parameter sets, DRM) rather than in this tool's unpacking"
+            )
+
+        # PID layout drift makes the demuxer follow the wrong program.
+        pid_sets = [frozenset(s["pids"]) for s in scans]
+        if len(set(pid_sets)) > 1:
+            findings.append(
+                "the segments do not all carry the same PID set — the demuxer "
+                "locks onto the first segment's PMT and will ignore streams "
+                "that move to a different PID later"
+            )
+
+        tei_total = sum(s["tei"] for s in scans)
+        if tei_total:
+            findings.append(f"{tei_total:,} packets have the transport_error "
+                            f"flag set — the source data is damaged")
+
+        base_ps = scans[0]["param_sets"]
+        drift = [p["n"] for p, s in zip(probes[1:], scans[1:])
+                 if s["param_sets"] - base_ps]
+        if drift:
+            findings.append(
+                f"segment(s) {drift} carry codec parameter sets that segment 1 "
+                f"never had. MP4 stores these once, up front, so a plain "
+                f"stream-copy keeps only segment 1's — every later segment then "
+                f"decodes into garbage. Keep the MPEG-TS instead (--keep-ts), "
+                f"which carries parameter sets in-band"
+            )
 
     if meta["overruns"]:
         findings.append("segment indices point past EOF — the .qsv is "
@@ -778,9 +1077,9 @@ def inspect_qsv(qsv_path: str) -> bool:
     if no_pcr:
         findings.append(f"segment(s) {no_pcr} carry no PCR in their first 64 KB "
                         "— cannot judge their timeline")
-    resets = detect_clock_resets(probes)
+    resets, clock = detect_any_resets(probes)
     if resets:
-        findings.append(f"clock resets at segment(s) {resets} — each shard has "
+        findings.append(f"{clock} resets at segment(s) {resets} — each shard has "
                         "its own timeline; splicing them produces non-monotonic "
                         "timestamps. Use --mux-mode concat")
 
@@ -871,6 +1170,12 @@ def _build_parser() -> argparse.ArgumentParser:
              "Paste this output into a bug report.",
     )
     p.add_argument(
+        "--no-deep", action="store_true",
+        help="With --inspect, skip the full per-segment TS grid walk "
+             "(faster, but cannot tell a mis-unpacked segment from an "
+             "encrypted one)",
+    )
+    p.add_argument(
         "--mux-mode", choices=("auto", "single", "concat"), default="auto",
         help="How to join segments: 'single' splices them into one TS (fast, "
              "assumes one shared clock), 'concat' muxes each segment separately "
@@ -899,7 +1204,7 @@ def main() -> None:
 
     if args.inspect:
         print(f"Inspecting {len(files)} .qsv file(s).")
-        ok = sum(inspect_qsv(q) for q in files)
+        ok = sum(inspect_qsv(q, deep=not args.no_deep) for q in files)
         sys.exit(0 if ok == len(files) else 1)
 
     print(f"Found {len(files)} .qsv file(s) to convert.")

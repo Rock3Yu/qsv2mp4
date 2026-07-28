@@ -53,7 +53,8 @@ possible causes:
 | *N gap(s), segments not contiguous* | Layout issue — handled automatically since this version |
 | *no TS sync after decryption* | The cipher or container layout does not match this file — please open an issue |
 | *clock resets at segment(s) …* | Each shard has its own timeline — retry with `--mux-mode concat` |
-| *all consistent* | Extraction is fine; the problem is elsewhere (player or ffmpeg version) |
+| *segment(s) … lose TS sync partway* | Those segments are still encrypted past their head — a format change this tool does not yet handle |
+| *hold TS sync end-to-end* | Extraction is byte-exact; the fault is inside the video stream (codec parameter sets, DRM), not in the unpacking |
 
 `--mux-mode concat` extracts each segment to its own `.ts` and joins them with
 ffmpeg's concat demuxer, which re-bases every segment's timestamps. Byte-splicing
@@ -132,7 +133,8 @@ python qsv2mp4.py --inspect movie.qsv
 | *N gap(s), segments not contiguous* | 分段不连续，本版本起已自动处理 |
 | *no TS sync after decryption* | 解密算法或容器布局与该文件不匹配，请提 issue |
 | *clock resets at segment(s) …* | 各分段时间轴独立，改用 `--mux-mode concat` |
-| *all consistent* | 提取环节正常，问题在别处（播放器或 ffmpeg 版本） |
+| *segment(s) … lose TS sync partway* | 这些分段在头部之后仍是密文，属于本工具尚未支持的格式变化 |
+| *hold TS sync end-to-end* | 提取是字节精确的，问题出在视频流内部（编码参数集、DRM），不在解包环节 |
 
 `--mux-mode concat` 会把每个分段单独提取，再用 ffmpeg 的 concat 解复用器拼接，
 从而重建每段的时间戳；`single` 是直接按字节拼接，更快，但前提是所有分段共用同一条时间轴。
