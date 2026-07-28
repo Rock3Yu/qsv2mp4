@@ -33,7 +33,7 @@ python qsv2mp4.py [INPUT ...] [options]
 | `--keep-ts` | Keep the intermediate `.ts` file |
 | `--dry-run` | Print what would be converted, do nothing |
 | `--inspect` | Diagnose a file: container layout, TS sync, per-segment clocks |
-| `--mux-mode` | `auto` (default) · `single` · `concat` — how to join segments |
+| `--mux-mode` | `auto` (default) · `single` · `concat` · `split` — how to join segments |
 | `-v` | Verbose — show progress and ffmpeg output |
 
 ### Troubleshooting
@@ -54,11 +54,33 @@ possible causes:
 | *no TS sync after decryption* | The cipher or container layout does not match this file — please open an issue |
 | *clock resets at segment(s) …* | Each shard has its own timeline — retry with `--mux-mode concat` |
 | *segment(s) … lose TS sync partway* | Those segments are still encrypted past their head — a format change this tool does not yet handle |
+| *carry codec parameter sets that segment 1 never had* | The shards are separate encodes — handled automatically, see below |
 | *hold TS sync end-to-end* | Extraction is byte-exact; the fault is inside the video stream (codec parameter sets, DRM), not in the unpacking |
 
 `--mux-mode concat` extracts each segment to its own `.ts` and joins them with
 ffmpeg's concat demuxer, which re-bases every segment's timestamps. Byte-splicing
 (`single`) is faster but assumes all segments share one clock.
+
+### Only the first part plays, the rest is macroblock soup
+
+An MP4 track carries **one** set of codec parameters, fixed by whatever the
+first frames declared. Some `.qsv` files are assembled from shards that are
+separate encodes — a different resolution or profile per shard — and MPEG-TS
+allows that because it repeats the parameters in-band. Copy such a stream into
+a single MP4 and every shard after the first decodes against the wrong
+parameters: the opening minutes look fine, the remainder is garbage.
+
+There is no lossless way to put that in one MP4, so the converter writes one
+file per parameter set instead:
+
+```
+movie.part1.mp4    segments 1–3
+movie.part2.mp4    segments 4–7
+```
+
+`auto` does this on its own when it detects the change; `--mux-mode split`
+forces it, and `--mux-mode single` opts out and warns. Each part is still a
+lossless stream copy.
 
 ### Examples
 
@@ -114,7 +136,7 @@ python qsv2mp4.py [INPUT ...] [选项]
 | `--keep-ts` | 保留中间 `.ts` 文件 |
 | `--dry-run` | 仅预览将要转换的文件，不实际执行 |
 | `--inspect` | 诊断模式：输出容器布局、TS 同步状态、各分段时钟 |
-| `--mux-mode` | `auto`（默认）· `single` · `concat` — 分段的拼接方式 |
+| `--mux-mode` | `auto`（默认）· `single` · `concat` · `split` — 分段的拼接方式 |
 | `-v` | 显示详细进度和 ffmpeg 输出 |
 
 ### 疑难排查
@@ -134,10 +156,28 @@ python qsv2mp4.py --inspect movie.qsv
 | *no TS sync after decryption* | 解密算法或容器布局与该文件不匹配，请提 issue |
 | *clock resets at segment(s) …* | 各分段时间轴独立，改用 `--mux-mode concat` |
 | *segment(s) … lose TS sync partway* | 这些分段在头部之后仍是密文，属于本工具尚未支持的格式变化 |
+| *carry codec parameter sets that segment 1 never had* | 各分段是彼此独立的编码，已自动处理，见下 |
 | *hold TS sync end-to-end* | 提取是字节精确的，问题出在视频流内部（编码参数集、DRM），不在解包环节 |
 
 `--mux-mode concat` 会把每个分段单独提取，再用 ffmpeg 的 concat 解复用器拼接，
 从而重建每段的时间戳；`single` 是直接按字节拼接，更快，但前提是所有分段共用同一条时间轴。
+
+### 只有开头一段能正常播放，后面全是花屏
+
+一条 MP4 轨道只能保存**一份**编码参数集，由最开始的那几帧确定。有些 `.qsv`
+的各个分段是彼此独立的编码——分辨率或 profile 逐段不同——MPEG-TS 允许这样，
+因为它把参数集随流反复内嵌。可一旦把这种流复制进单个 MP4，第一段之后的所有
+分段都会按错误的参数去解码：开头几分钟正常，后面全是花屏。
+
+这种情况没有无损塞进单个 MP4 的办法，所以转换器改为按参数集分文件输出：
+
+```
+movie.part1.mp4    分段 1–3
+movie.part2.mp4    分段 4–7
+```
+
+`auto` 检测到参数集变化时会自动这么做；`--mux-mode split` 可强制启用，
+`--mux-mode single` 则退回单文件并给出警告。每个分片文件依然是无损流复制。
 
 ### 示例
 

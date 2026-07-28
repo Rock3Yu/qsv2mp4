@@ -40,17 +40,23 @@ Options
   --keep-ts        Keep the intermediate MPEG-TS file
   --dry-run        Print what would be done without converting
   --inspect        Dump container layout / TS sync / per-segment clocks
-  --mux-mode       auto (default) | single | concat
+  --mux-mode       auto (default) | single | concat | split
   -v, --verbose    Show ffmpeg output
 
 Troubleshooting
 ---------------
 If the .mp4 is produced but only the first part plays cleanly, run --inspect.
 It reports, per segment, whether the index offsets are consistent, whether the
-descrambled data really starts on an MPEG-TS sync byte, and whether the
-segments share one clock.  Segments with independent clocks need
---mux-mode concat, which muxes each one separately instead of byte-splicing
-them into a single stream.
+descrambled data really starts on an MPEG-TS sync byte, whether the segments
+share one clock, and whether they share one set of codec parameters.
+
+Segments with independent clocks need --mux-mode concat, which muxes each one
+separately instead of byte-splicing them into a single stream.
+
+Segments that are separate encodes cannot go into one MP4 at all: an MP4 track
+describes its codec once, so everything after the first parameter set decodes
+against the wrong one.  Those files are written as movie.part1.mp4,
+movie.part2.mp4, … one per parameter set (--mux-mode split forces this).
 """
 
 from __future__ import annotations
@@ -127,7 +133,7 @@ def first_pcr(buf: bytes, sync: int = 0) -> float | None:
     segments tells us whether the shards share one timeline or each restart
     at zero.
     """
-    for i in range(sync, len(buf) - TS_PACKET, TS_PACKET):
+    for i in range(sync, len(buf) - TS_PACKET + 1, TS_PACKET):
         if buf[i] != 0x47:
             continue
         afc = (buf[i + 3] >> 4) & 0b11
@@ -154,7 +160,7 @@ def first_pts(buf: bytes, sync: int = 0) -> float | None:
     into the MP4.  They usually agree, but a container assembled from shards can
     have a tidy PCR and a broken PTS, so both are worth checking.
     """
-    for i in range(sync, len(buf) - TS_PACKET, TS_PACKET):
+    for i in range(sync, len(buf) - TS_PACKET + 1, TS_PACKET):
         if buf[i] != 0x47:
             continue
         if not (buf[i + 1] & 0x40):        # payload_unit_start_indicator
@@ -478,17 +484,25 @@ _PS_PATTERNS = (
     (b"\x00\x00\x01\x68",     "PPS"),      # H.264, nal_ref_idc 3 + type 8
 )
 
-_PS_CAPTURE = 24        # bytes of parameter set to fingerprint
+_PS_CAPTURE = 24        # upper bound on the bytes of parameter set to fingerprint
 
 
-def _param_sets(buf: bytes, base: int) -> set:
+def _param_sets(buf: bytes) -> set:
     """
-    Fingerprint the parameter sets in *buf*, which starts on a TS packet
-    boundary at absolute offset *base* within its segment.
+    Fingerprint the parameter sets in *buf*, which must start on a TS packet
+    boundary.
 
-    Only matches that fit entirely inside one packet payload are taken, so a
-    4-byte TS header never lands in the middle of a fingerprint and makes two
-    identical parameter sets look different.
+    Two constraints keep a fingerprint from depending on anything but the
+    parameter set itself:
+
+      - the capture must fit inside one packet payload, so a 4-byte TS header
+        never lands in the middle of it;
+      - the capture stops at the next Annex-B start code.  Parameter sets are
+        short — an H.264 PPS is often 3 bytes — so a fixed-width window would
+        run past the end and swallow whichever NAL happens to follow.  That
+        neighbour varies (SEI after one access unit, a slice after the next),
+        which made identical parameter sets fingerprint differently and
+        reported drift on healthy files.
     """
     found = set()
     for pattern, kind in _PS_PATTERNS:
@@ -499,10 +513,17 @@ def _param_sets(buf: bytes, base: int) -> set:
                 break
             start = p + 1
             off = p % TS_PACKET
-            if off + len(pattern) + _PS_CAPTURE > TS_PACKET:
-                continue                    # would straddle a packet header
-            blob = buf[p + len(pattern):p + len(pattern) + _PS_CAPTURE]
-            found.add((kind, blob.hex()))
+            if off + len(pattern) >= TS_PACKET:
+                continue                    # header itself straddles a packet
+            body = p + len(pattern)
+            # Never read beyond this packet, and never past the NAL's own end.
+            room = min(_PS_CAPTURE, TS_PACKET - (off + len(pattern)))
+            blob = buf[body:body + room]
+            end = blob.find(b"\x00\x00\x01")
+            if end >= 0:
+                blob = blob[:end]
+            if blob:
+                found.add((kind, blob.hex()))
     return found
 
 
@@ -564,7 +585,7 @@ def scan_segment(src, seg_offset: int, seg_size: int, file_size: int,
                         break
 
         tei += buf[1::TS_PACKET].translate(_TEI_TABLE).count(1)
-        param_sets |= _param_sets(buf, consumed)
+        param_sets |= _param_sets(buf)
 
         if len(pids) < 64 and consumed // TS_PACKET < pid_sample:
             b1 = buf[1::TS_PACKET]
@@ -586,6 +607,81 @@ def scan_segment(src, seg_offset: int, seg_size: int, file_size: int,
         "scanned":    consumed,
         "size":       seg_size,
     }
+
+
+PS_PROBE_CAP = 24 << 20         # give up looking for a parameter set after 24 MiB
+
+
+def probe_param_sets(src, seg_offset: int, seg_size: int, file_size: int,
+                     cap: int = PS_PROBE_CAP) -> set:
+    """
+    Return the parameter sets at the start of one segment, reading only as far
+    as it takes to find one (capped at *cap*).
+
+    The full :func:`scan_segment` walk costs ~12 s/GB, which is too much to pay
+    on every conversion.  Parameter sets are repeated at every IDR, so the first
+    few MiB of a segment almost always carry them.
+    """
+    CHUNK = TS_PACKET * 8192
+    avail = max(0, min(seg_size, file_size - seg_offset))
+    src.seek(seg_offset)
+
+    found     = set()
+    consumed  = 0
+    remaining = min(avail, cap)
+    first     = True
+
+    while remaining >= TS_PACKET:
+        want = min(CHUNK, remaining - (remaining % TS_PACKET))
+        if want < TS_PACKET:
+            break
+        buf = src.read(want)
+        if not buf:
+            break
+        if len(buf) % TS_PACKET:
+            buf = buf[:len(buf) - (len(buf) % TS_PACKET)]
+            if not buf:
+                break
+        if first:
+            head = bytearray(buf[:min(HEAD_LEN, len(buf))])
+            _decrypt_2(head)
+            buf = bytes(head) + buf[len(head):]
+            first = False
+
+        found |= _param_sets(buf)
+        if found:
+            break
+        consumed  += len(buf)
+        remaining -= len(buf)
+
+    return found
+
+
+def group_by_param_sets(psets) -> list:
+    """
+    Split the segment list into runs that one MP4 can hold.
+
+    MP4 keeps a single sample description per track, so a stream-copy fixes the
+    decoder to whichever parameter sets appeared first.  Every segment that
+    introduces a parameter set the run leader did not have starts a new run —
+    those segments have to go into their own file to decode correctly.
+
+    Segments whose parameter sets could not be read stay with the current run:
+    guessing a split on missing evidence would fragment a healthy file.
+    """
+    groups = []
+    cur, leader = [], set()
+    for n, ps in enumerate(psets, 1):
+        if not cur:
+            cur, leader = [n], set(ps)
+        elif ps - leader:
+            groups.append(cur)
+            cur, leader = [n], set(ps)
+        else:
+            cur.append(n)
+    if cur:
+        groups.append(cur)
+    return groups
 
 
 def detect_clock_resets(probes, key: str = "pcr") -> list:
@@ -727,7 +823,7 @@ def ts_to_mp4(ts_path: str, mp4_path: str, verbose: bool = False):
 
 
 def segments_to_mp4(seg_paths, mp4_path: str, work_dir: str,
-                    verbose: bool = False):
+                    verbose: bool = False, list_name: str = "concat.txt"):
     """
     Join the per-segment .ts files via ffmpeg's concat demuxer.
 
@@ -737,7 +833,7 @@ def segments_to_mp4(seg_paths, mp4_path: str, work_dir: str,
 
     Returns (ok, red_flag_counts).
     """
-    list_path = os.path.join(work_dir, "concat.txt")
+    list_path = os.path.join(work_dir, list_name)
     with open(list_path, "w", encoding="utf-8") as fh:
         for p in seg_paths:
             escaped = p.replace("'", r"'\''")
@@ -824,7 +920,8 @@ def convert_one(qsv_path: str,
 
     # ── Decide how to mux ────────────────────────────────────────────────────
     resets, clock = [], None
-    if seg_count > 1 and mux_mode in ("auto", "concat"):
+    groups = [list(range(1, seg_count + 1))]
+    if seg_count > 1:
         probes = probe_segments(qsv_path, indices)
         resets, clock = detect_any_resets(probes)
         bad_sync = [p["n"] for p in probes if p["sync"] != 0]
@@ -832,11 +929,31 @@ def convert_one(qsv_path: str,
             print(f"  [WARN] segment(s) {bad_sync} do not start with an MPEG-TS "
                   f"sync byte after decryption — run --inspect for details")
 
-    use_concat = (mux_mode == "concat") or (mux_mode == "auto" and bool(resets))
+        # A stream-copy to MP4 freezes the decoder on the parameter sets it saw
+        # first, so segments that bring their own have to land in their own file.
+        with open(qsv_path, "rb") as src:
+            fsize = os.fstat(src.fileno()).st_size
+            psets = [probe_param_sets(src, off, size, fsize)
+                     for _, off, size in indices]
+        groups = group_by_param_sets(psets)
+
+    use_split  = len(groups) > 1 and mux_mode in ("auto", "split")
+    use_concat = (mux_mode in ("concat", "split")
+                  or (mux_mode == "auto" and bool(resets))
+                  or use_split)
     if resets:
         print(f"  [note] {clock} resets at segment(s) {resets} "
               f"— each shard has its own timeline")
-    if use_concat and seg_count > 1:
+    if len(groups) > 1:
+        print(f"  [note] codec parameter sets change at segment(s) "
+              f"{[g[0] for g in groups[1:]]} — one MP4 cannot describe them all")
+        if not use_split:
+            print("  [WARN] --mux-mode forces a single file; everything after "
+                  "segment 1's parameter set will decode into garbage")
+    if use_split:
+        print(f"  Strategy: per-segment extract + one MP4 per parameter set "
+              f"({len(groups)} parts)")
+    elif use_concat and seg_count > 1:
         print("  Strategy: per-segment extract + ffmpeg concat demuxer")
 
     os.makedirs(dest_dir, exist_ok=True)
@@ -868,16 +985,42 @@ def convert_one(qsv_path: str,
         # ── Convert ────────────────────────────────────────────────────────────
         print("  Muxing TS → MP4 via ffmpeg …", flush=True)
         t1 = time.time()
-        if seg_paths is not None:
+        written_paths = []
+        flags = {}
+        ok = True
+
+        if use_split and seg_paths is not None:
+            # One file per parameter set.  Segment numbers are 1-based and
+            # extract_segments drops empty segments, so map by index carefully.
+            by_n = {n: p for n, p in zip(
+                [n for n, (_, _, sz) in enumerate(indices, 1) if sz > 0],
+                seg_paths)}
+            for i, group in enumerate(groups, 1):
+                part = os.path.join(dest_dir, f"{stem}.part{i}.mp4")
+                members = [by_n[n] for n in group if n in by_n]
+                if not members:
+                    continue
+                part_ok, part_flags = segments_to_mp4(
+                    members, part, work_dir, verbose=verbose,
+                    list_name=f"concat{i}.txt")
+                ok = ok and part_ok
+                for k, v in part_flags.items():
+                    flags[k] = flags.get(k, 0) + v
+                if part_ok:
+                    written_paths.append(part)
+        elif seg_paths is not None:
             ok, flags = segments_to_mp4(seg_paths, mp4_path, work_dir,
                                         verbose=verbose)
+            written_paths = [mp4_path] if ok else []
         else:
             ok, flags = ts_to_mp4(work_ts, mp4_path, verbose=verbose)
+            written_paths = [mp4_path] if ok else []
 
         if ok:
             elapsed2 = time.time() - t1
-            out_mb = os.path.getsize(mp4_path) / (1 << 20)
-            print(f"  Muxed in {elapsed2:.1f}s  |  Output: {out_mb:.1f} MB")
+            out_mb = sum(os.path.getsize(p) for p in written_paths) / (1 << 20)
+            print(f"  Muxed in {elapsed2:.1f}s  |  Output: {out_mb:.1f} MB"
+                  f"{f' across {len(written_paths)} parts' if use_split else ''}")
 
             severe = {l: c for l, c in flags.items() if l in _SEVERE_LABELS}
             minor  = {l: c for l, c in flags.items() if l not in _SEVERE_LABELS}
@@ -905,10 +1048,11 @@ def convert_one(qsv_path: str,
                 print(f"  ⚠ Output written, but playback is likely corrupt.{hint}"
                       f" Run --inspect and open an issue if it persists.")
             elif warns:
-                print(f"  ⚠ Done with warnings — some source data was missing.  "
-                      f"{mp4_path}")
+                print(f"  ⚠ Done with warnings — some source data was missing.")
             else:
-                print(f"  ✓ Done!  {mp4_path}")
+                print(f"  ✓ Done!")
+            for p in written_paths:
+                print(f"      {p}")
         else:
             print("  ✗ ffmpeg failed.")
         return ok
@@ -918,10 +1062,16 @@ def convert_one(qsv_path: str,
         return False
 
     finally:
-        if keep_ts and seg_paths is not None:
-            print(f"  [note] --keep-ts: per-segment files are in {work_dir}")
-        else:
-            shutil.rmtree(work_dir, ignore_errors=True)
+        # --keep-ts promises the intermediate TS next to the output, so the
+        # per-segment files get copied out rather than left in a temp dir that
+        # nothing ever cleans up.
+        if keep_ts and seg_paths:
+            kept = os.path.join(dest_dir, stem + ".ts.d")
+            os.makedirs(kept, exist_ok=True)
+            for p in seg_paths:
+                shutil.copy2(p, os.path.join(kept, os.path.basename(p)))
+            print(f"  [note] --keep-ts: {len(seg_paths)} segment .ts file(s) in {kept}")
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1036,14 +1186,18 @@ def inspect_qsv(qsv_path: str, deep: bool = True) -> bool:
                 "parameter sets, DRM) rather than in this tool's unpacking"
             )
 
-        # PID layout drift makes the demuxer follow the wrong program.
-        pid_sets = [frozenset(s["pids"]) for s in scans]
-        if len(set(pid_sets)) > 1:
-            findings.append(
-                "the segments do not all carry the same PID set — the demuxer "
-                "locks onto the first segment's PMT and will ignore streams "
-                "that move to a different PID later"
-            )
+        # PID layout drift makes the demuxer follow the wrong program.  Only
+        # trust it where the TS grid held: in a segment that lost sync the PID
+        # bytes are ciphertext, so they always "differ" and would bury the real
+        # finding under a spurious one.
+        if not broken:
+            pid_sets = [frozenset(s["pids"]) for s in scans]
+            if len(set(pid_sets)) > 1:
+                findings.append(
+                    "the segments do not all carry the same PID set — the demuxer "
+                    "locks onto the first segment's PMT and will ignore streams "
+                    "that move to a different PID later"
+                )
 
         tei_total = sum(s["tei"] for s in scans)
         if tei_total:
@@ -1052,14 +1206,15 @@ def inspect_qsv(qsv_path: str, deep: bool = True) -> bool:
 
         base_ps = scans[0]["param_sets"]
         drift = [p["n"] for p, s in zip(probes[1:], scans[1:])
-                 if s["param_sets"] - base_ps]
+                 if s["param_sets"] - base_ps] if not broken else []
         if drift:
             findings.append(
                 f"segment(s) {drift} carry codec parameter sets that segment 1 "
                 f"never had. MP4 stores these once, up front, so a plain "
                 f"stream-copy keeps only segment 1's — every later segment then "
-                f"decodes into garbage. Keep the MPEG-TS instead (--keep-ts), "
-                f"which carries parameter sets in-band"
+                f"decodes into garbage. Converting this file now writes one "
+                f"'.partN.mp4' per parameter set automatically "
+                f"(--mux-mode split forces it)"
             )
 
     if meta["overruns"]:
@@ -1176,11 +1331,15 @@ def _build_parser() -> argparse.ArgumentParser:
              "encrypted one)",
     )
     p.add_argument(
-        "--mux-mode", choices=("auto", "single", "concat"), default="auto",
+        "--mux-mode", choices=("auto", "single", "concat", "split"),
+        default="auto",
         help="How to join segments: 'single' splices them into one TS (fast, "
              "assumes one shared clock), 'concat' muxes each segment separately "
-             "and joins via ffmpeg's concat demuxer (handles per-shard clocks). "
-             "'auto' (default) picks concat when a clock reset is detected.",
+             "and joins via ffmpeg's concat demuxer (handles per-shard clocks), "
+             "'split' additionally writes one .partN.mp4 per codec parameter "
+             "set (handles shards that are separate encodes). "
+             "'auto' (default) picks concat on a clock reset and split when the "
+             "parameter sets change.",
     )
     p.add_argument(
         "-v", "--verbose", action="store_true",
