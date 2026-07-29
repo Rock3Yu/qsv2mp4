@@ -1,2 +1,8 @@
 __pycache__/
 .DS_Store
+
+# Sample media used while debugging — never commit
+download/
+*.qsv
+*.ts
+*.mp4
