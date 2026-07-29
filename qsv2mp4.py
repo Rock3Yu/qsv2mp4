@@ -41,6 +41,7 @@ Options
   --dry-run        Print what would be done without converting
   --inspect        Dump container layout / TS sync / per-segment clocks
   --mux-mode       auto (default) | single | concat | split
+  --salvage-clear  On a DRM-protected file, convert the unencrypted segments
   -v, --verbose    Show ffmpeg output
 
 Troubleshooting
@@ -57,11 +58,18 @@ Segments that are separate encodes cannot go into one MP4 at all: an MP4 track
 describes its codec once, so everything after the first parameter set decodes
 against the wrong one.  Those files are written as movie.part1.mp4,
 movie.part2.mp4, … one per parameter set (--mux-mode split forces this).
+
+Some downloads are DRM-protected: the container unpacks perfectly, but the
+video inside most segments is encrypted under a key that lives on iQIYI's
+licence server and was never written to the file.  Nothing here can decode
+those, so such files are refused rather than converted into an unplayable
+result; --salvage-clear converts whatever segments are in the clear.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import struct
@@ -308,6 +316,70 @@ def parse_qsv(path: str):
         "contiguous":         not gaps,
     }
     return indices, total, meta
+
+
+def read_metadata(path: str, meta: dict):
+    """
+    Decrypt and parse the JSON descriptor iQIYI stores between the index table
+    and the first segment.  Returns the ``qsv_info`` object, or None.
+
+    Everything read here is informational, so any failure returns None rather
+    than raising — a container whose descriptor moved or changed shape must
+    still convert exactly as it did before.
+    """
+    off, size = meta.get("xml_offset") or 0, meta.get("xml_size") or 0
+    if off <= 0 or not 0 < size <= (16 << 20):
+        return None
+    try:
+        with open(path, "rb") as f:
+            f.seek(off)
+            blob = bytearray(f.read(size))
+        _decrypt_1(blob)
+        start = blob.find(b"{")
+        if start < 0:
+            return None
+        obj, _ = json.JSONDecoder().raw_decode(
+            blob[start:].decode("utf-8", "replace"))
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    info = obj.get("qsv_info")
+    return info if isinstance(info, dict) else None
+
+
+def drm_info(qsv_info):
+    """
+    Describe the DRM declared in the descriptor, or None if it declares none.
+
+    The licence ticket is the decisive signal.  It is the blob a player trades
+    with iQIYI's licence server for the content key, so its presence means the
+    elementary stream is encrypted under a key that is deliberately *not* in
+    this file — no amount of work on the container will produce clear video.
+    """
+    if not isinstance(qsv_info, dict):
+        return None
+    ticket = qsv_info.get("drmticket")
+    ticket = ticket if isinstance(ticket, dict) else {}
+    data = ticket.get("ticketdata")
+    version = qsv_info.get("drmversion")
+    if not data and not version:
+        return None
+
+    bits = []
+    if version:
+        bits.append(f"version {version}")
+    if qsv_info.get("dr") is not None:
+        bits.append(f"dr={qsv_info['dr']}")
+    if qsv_info.get("edrtype"):
+        bits.append(f"edrtype={qsv_info['edrtype']}")
+    if data:
+        bits.append(f"licence ticket {len(data)} chars")
+    return {
+        "version": version,
+        "ticket":  bool(data),
+        "label":   "iQIYI DRM (" + ", ".join(bits) + ")",
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -924,6 +996,7 @@ def convert_one(qsv_path: str,
                 skip_existing: bool = False,
                 dry_run: bool = False,
                 mux_mode: str = "auto",
+                salvage_clear: bool = False,
                 verbose: bool = False) -> bool:
     """
     Convert a single QSV file to MP4.
@@ -935,6 +1008,8 @@ def convert_one(qsv_path: str,
     keep_ts      : keep the intermediate .ts file
     skip_existing: skip if a .mp4 already exists at the destination
     dry_run      : print plan only, do not write anything
+    salvage_clear: on a DRM-protected file, convert the unencrypted segments
+                   instead of refusing outright
     verbose      : extra logging
 
     Returns True on success.
@@ -978,6 +1053,44 @@ def convert_one(qsv_path: str,
     for n, over in meta["overruns"]:
         print(f"  [WARN] segment {n} runs {over:,} bytes past EOF "
               f"— the .qsv download is incomplete")
+
+    # ── DRM ──────────────────────────────────────────────────────────────────
+    # Only files that actually declare a licence ticket pay for the decode
+    # probe, so an ordinary .qsv converts on exactly the path it always did.
+    drm = drm_info(read_metadata(qsv_path, meta))
+    if drm:
+        print(f"  [note] {drm['label']}")
+        decodes = probe_decodable(qsv_path, indices, verbose=verbose)
+        dead  = [d["n"] for d in decodes if not d["ok"]]
+        clear = [d["n"] for d in decodes if d["ok"]]
+        if dead:
+            print(f"  [WARN] segment(s) {dead} carry encrypted video — a "
+                  f"decoder finds no codec parameters in them.")
+            print(f"         The container unpacks fine; the elementary stream "
+                  f"is locked to a key held by")
+            print(f"         iQIYI's licence server and is not present in the "
+                  f"file. Converting those segments")
+            print(f"         yields a file that plays as macroblock soup.")
+            if not clear:
+                print("  ✗ Nothing in this file is convertible.")
+                return False
+            if not salvage_clear:
+                print(f"  ✗ Refusing to write a mostly-unplayable file. "
+                      f"Segment(s) {clear} are in the clear —")
+                print(f"    re-run with --salvage-clear to convert just those, "
+                      f"or --inspect for the full report.")
+                return False
+            print(f"  [note] --salvage-clear: converting segment(s) {clear} "
+                  f"only, dropping {len(dead)} encrypted segment(s)")
+            keep = set(clear)
+            indices = [ix for n, ix in enumerate(indices, 1) if n in keep]
+            total = sum(sz for _, _, sz in indices)
+            seg_count = len(indices)
+            # A partial rip gets a distinct name: nobody should mistake a
+            # six-minute file for the feature they asked to convert.
+            mp4_path = os.path.join(dest_dir, stem + ".clear.mp4")
+            ts_path = os.path.join(dest_dir, stem + ".clear.ts") if keep_ts else None
+            print(f"  Output : {mp4_path}  (revised)")
 
     # ── Decide how to mux ────────────────────────────────────────────────────
     resets, clock = [], None
@@ -1169,6 +1282,13 @@ def inspect_qsv(qsv_path: str, deep: bool = True) -> bool:
           f"entries {meta['nb_indices']}")
     print(f"  TS payload   : {total:,} bytes ({total / (1 << 20):.1f} MB)")
 
+    qsv_info = read_metadata(qsv_path, meta)
+    drm = drm_info(qsv_info)
+    if drm:
+        print(f"  DRM          : {drm['label']}")
+    elif qsv_info is not None:
+        print(f"  DRM          : none declared")
+
     payload_end = max(off + sz for _, off, sz in indices)
     trailing = meta["file_size"] - payload_end
     print(f"  accounted    : {total / meta['file_size'] * 100:.1f}% of the file"
@@ -1299,17 +1419,31 @@ def inspect_qsv(qsv_path: str, deep: bool = True) -> bool:
             )
 
     if decodes:
-        dead = [d["n"] for d in decodes if not d["ok"]]
-        if dead and len(dead) < len(decodes):
+        dead  = [d["n"] for d in decodes if not d["ok"]]
+        clear = [d["n"] for d in decodes if d["ok"]]
+        if dead and drm:
+            # The descriptor named a licence server, and the decoder confirms
+            # the stream needs it.  That pair is conclusive, so say so plainly
+            # instead of inviting a bug report this tool can never act on.
             findings.append(
-                f"a decoder finds codec parameters in segment(s) "
-                f"{[d['n'] for d in decodes if d['ok']]} but none in "
-                f"{dead}, even though the TS framing of all of them is intact. "
-                f"The container is being unpacked correctly and the elementary "
-                f"stream inside {dead} is not readable — the payload past the "
-                f"1024-byte head is still scrambled, or is scrambled a way this "
-                f"tool does not undo. Muxing those segments on their own cannot "
-                f"work; please report this output"
+                f"this file is DRM-protected and segment(s) {dead} are "
+                f"encrypted video: {drm['label']}. The container unpacks "
+                f"correctly — TS framing, PIDs, PCR and PTS are all intact — "
+                f"but the elementary stream inside those segments is encrypted "
+                f"under a key held by iQIYI's licence server, not stored in the "
+                f"file. No unpacker can recover it"
+                + (f". Segment(s) {clear} are in the clear and can still be "
+                   f"converted with --salvage-clear" if clear else "")
+            )
+        elif dead and len(dead) < len(decodes):
+            findings.append(
+                f"a decoder finds codec parameters in segment(s) {clear} but "
+                f"none in {dead}, even though the TS framing of all of them is "
+                f"intact. The container is being unpacked correctly and the "
+                f"elementary stream inside {dead} is not readable — the payload "
+                f"past the 1024-byte head is still scrambled, or is scrambled a "
+                f"way this tool does not undo. Muxing those segments on their "
+                f"own cannot work; please report this output"
             )
         elif dead:
             findings.append(
@@ -1442,6 +1576,13 @@ def _build_parser() -> argparse.ArgumentParser:
              "parameter sets change.",
     )
     p.add_argument(
+        "--salvage-clear", action="store_true",
+        help="If the file is DRM-protected, convert the segments that are not "
+             "encrypted instead of refusing, writing NAME.clear.mp4. The "
+             "encrypted segments are dropped — they cannot be decoded without "
+             "iQIYI's licence key.",
+    )
+    p.add_argument(
         "-v", "--verbose", action="store_true",
         help="Show extraction progress and full ffmpeg output",
     )
@@ -1480,6 +1621,7 @@ def main() -> None:
             skip_existing=args.skip_existing,
             dry_run=args.dry_run,
             mux_mode=args.mux_mode,
+            salvage_clear=args.salvage_clear,
             verbose=args.verbose,
         ):
             success += 1

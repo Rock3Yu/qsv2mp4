@@ -34,6 +34,7 @@ python qsv2mp4.py [INPUT ...] [options]
 | `--dry-run` | Print what would be converted, do nothing |
 | `--inspect` | Diagnose a file: container layout, TS sync, per-segment clocks |
 | `--mux-mode` | `auto` (default) · `single` · `concat` · `split` — how to join segments |
+| `--salvage-clear` | On a DRM-protected file, convert the segments that aren't encrypted |
 | `-v` | Verbose — show progress and ffmpeg output |
 
 ### Troubleshooting
@@ -55,7 +56,8 @@ possible causes:
 | *clock resets at segment(s) …* | Each shard has its own timeline — retry with `--mux-mode concat` |
 | *segment(s) … lose TS sync partway* | Those segments are still encrypted past their head — a format change this tool does not yet handle |
 | *carry codec parameter sets that segment 1 never had* | The shards are separate encodes — handled automatically, see below |
-| *hold TS sync end-to-end* | Extraction is byte-exact; the fault is inside the video stream (codec parameter sets, DRM), not in the unpacking |
+| *this file is DRM-protected* | The video is encrypted with a key iQIYI never wrote to the file — see below |
+| *hold TS sync end-to-end* | The container unpacked correctly; if playback is still wrong the fault is inside the video stream, not in the unpacking |
 
 `--mux-mode concat` extracts each segment to its own `.ts` and joins them with
 ffmpeg's concat demuxer, which re-bases every segment's timestamps. Byte-splicing
@@ -83,6 +85,32 @@ only helps when every shard is independently decodable; a shard that carries no
 parameter set of its own becomes an MP4 that will not open at all. Run
 `--inspect` first — its per-segment decode check says which case you are in —
 and confirm each part plays before discarding the source.
+
+### DRM-protected downloads
+
+Some downloads are encrypted, and this tool cannot convert them. `--inspect`
+names the case outright:
+
+```
+  DRM          : iQIYI DRM (version 3.1.0, dr=4, edrtype=cuva, licence ticket 2048 chars)
+    #       codec      dimensions                       verdict
+    1        hevc       3840x1608                            ok
+    2        hevc               —     no codec parameters found
+```
+
+The container still unpacks perfectly — TS framing, PIDs, PCR and PTS are all
+intact — but the video inside the protected segments is encrypted under a key
+that lives on iQIYI's licence server and was never written to the file. There
+is nothing to reverse: no unpacker, this one included, can produce clear video
+from it. Converting anyway just yields a file that plays as macroblock soup,
+so those files are refused rather than silently written.
+
+Typically only the opening segment is left in the clear (the free preview).
+`--salvage-clear` converts that part on its own, to `NAME.clear.mp4`:
+
+```bash
+python qsv2mp4.py --salvage-clear movie.qsv
+```
 
 ### Examples
 
@@ -139,6 +167,7 @@ python qsv2mp4.py [INPUT ...] [选项]
 | `--dry-run` | 仅预览将要转换的文件，不实际执行 |
 | `--inspect` | 诊断模式：输出容器布局、TS 同步状态、各分段时钟 |
 | `--mux-mode` | `auto`（默认）· `single` · `concat` · `split` — 分段的拼接方式 |
+| `--salvage-clear` | 对有 DRM 保护的文件，只转换其中未加密的分段 |
 | `-v` | 显示详细进度和 ffmpeg 输出 |
 
 ### 疑难排查
@@ -159,7 +188,8 @@ python qsv2mp4.py --inspect movie.qsv
 | *clock resets at segment(s) …* | 各分段时间轴独立，改用 `--mux-mode concat` |
 | *segment(s) … lose TS sync partway* | 这些分段在头部之后仍是密文，属于本工具尚未支持的格式变化 |
 | *carry codec parameter sets that segment 1 never had* | 各分段是彼此独立的编码，已自动处理，见下 |
-| *hold TS sync end-to-end* | 提取是字节精确的，问题出在视频流内部（编码参数集、DRM），不在解包环节 |
+| *this file is DRM-protected* | 视频被 DRM 加密，密钥根本不在文件里，见下 |
+| *hold TS sync end-to-end* | 容器解包正确；若播放仍有问题，原因在视频流内部，不在解包环节 |
 
 `--mux-mode concat` 会把每个分段单独提取，再用 ffmpeg 的 concat 解复用器拼接，
 从而重建每段的时间戳；`single` 是直接按字节拼接，更快，但前提是所有分段共用同一条时间轴。
@@ -181,6 +211,29 @@ movie.part2.mp4    分段 4–7
 这是**手动开关**，用之前先了解清楚：只有当每个分段都能独立解码时分文件才有意义；
 若某个分段本身不带参数集，拆出来的 MP4 会**完全打不开**。请先跑 `--inspect`，
 其中的逐段解码检查会告诉你属于哪种情况，并在删掉源文件前确认每个分片都能播放。
+
+### 带 DRM 保护的下载文件
+
+有些下载文件是加密的，本工具无法转换。`--inspect` 会直接点明：
+
+```
+  DRM          : iQIYI DRM (version 3.1.0, dr=4, edrtype=cuva, licence ticket 2048 chars)
+    #       codec      dimensions                       verdict
+    1        hevc       3840x1608                            ok
+    2        hevc               —     no codec parameters found
+```
+
+此时容器本身解包完全正常——TS 帧结构、PID、PCR、PTS 全部完好——但受保护分段里的
+视频码流是用爱奇艺授权服务器上的密钥加密的，**该密钥从未写进这个文件**。
+所以这里没有什么可以「逆向」的：任何解包工具（包括本工具）都不可能还原出明文视频。
+强行转换只会得到一个满屏花屏的文件，因此本工具会直接拒绝，而不是悄悄写出一个坏文件。
+
+通常只有开头第一个分段是明文的（也就是免费试看的部分）。
+`--salvage-clear` 可以只把这部分单独转换出来，输出为 `NAME.clear.mp4`：
+
+```bash
+python qsv2mp4.py --salvage-clear movie.qsv
+```
 
 ### 示例
 
