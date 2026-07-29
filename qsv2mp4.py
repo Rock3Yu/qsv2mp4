@@ -484,7 +484,6 @@ _PS_PATTERNS = (
     (b"\x00\x00\x01\x68",     "PPS"),      # H.264, nal_ref_idc 3 + type 8
 )
 
-_PS_CAPTURE = 24        # upper bound on the bytes of parameter set to fingerprint
 
 
 def _param_sets(buf: bytes) -> set:
@@ -516,12 +515,21 @@ def _param_sets(buf: bytes) -> set:
             if off + len(pattern) >= TS_PACKET:
                 continue                    # header itself straddles a packet
             body = p + len(pattern)
-            # Never read beyond this packet, and never past the NAL's own end.
-            room = min(_PS_CAPTURE, TS_PACKET - (off + len(pattern)))
+            # Search to the end of the packet, not a fixed window: a parameter
+            # set runs ~30 bytes, so a short window would miss the start code
+            # that delimits it and the match would be dropped.
+            room = TS_PACKET - (off + len(pattern))
             blob = buf[body:body + room]
             end = blob.find(b"\x00\x00\x01")
-            if end >= 0:
-                blob = blob[:end]
+            if end < 0:
+                # The NAL does not end inside this packet, so *room* — and with
+                # it the fingerprint — depends on where the parameter set
+                # happened to land in the 188-byte grid.  One unchanging SPS
+                # fingerprinted 24 different ways that way, which is how a
+                # single continuous encode came to look like 288 parameter
+                # sets.  Only fingerprint what we can delimit.
+                continue
+            blob = blob[:end]
             if blob:
                 found.add((kind, blob.hex()))
     return found
@@ -655,6 +663,59 @@ def probe_param_sets(src, seg_offset: int, seg_size: int, file_size: int,
         remaining -= len(buf)
 
     return found
+
+
+def probe_decodable(qsv_path: str, indices, sample: int = 12 << 20,
+                    verbose: bool = False) -> list:
+    """
+    Ask a decoder whether each segment stands on its own.
+
+    Byte patterns can only say that two segments *differ*.  What actually
+    decides whether a segment survives being muxed on its own is whether a
+    decoder can find codec parameters in it, so this extracts the first
+    *sample* bytes of each segment and puts ffprobe on them.
+
+    Returns one dict per segment with 'codec', 'width', 'height' and 'ok'.
+    """
+    import json
+
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return []
+
+    out = []
+    work = tempfile.mkdtemp(prefix="qsv2mp4-probe-")
+    try:
+        with open(qsv_path, "rb") as src:
+            file_size = os.fstat(src.fileno()).st_size
+            for n, (_, off, size) in enumerate(indices, 1):
+                part = os.path.join(work, f"probe_{n}.ts")
+                with open(part, "wb") as dst:
+                    _copy_segment(src, dst, n, off, min(size, sample),
+                                  file_size, [])
+                res = subprocess.run(
+                    [ffprobe, "-v", "error", "-show_entries",
+                     "stream=codec_type,codec_name,width,height",
+                     "-of", "json", part],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                info = {"n": n, "codec": None, "width": None,
+                        "height": None, "ok": False}
+                try:
+                    streams = json.loads(res.stdout or b"{}").get("streams", [])
+                except ValueError:
+                    streams = []
+                for s in streams:
+                    if s.get("codec_type") == "video":
+                        info["codec"]  = s.get("codec_name")
+                        info["width"]  = s.get("width")
+                        info["height"] = s.get("height")
+                        info["ok"]     = bool(s.get("width"))
+                        break
+                out.append(info)
+                os.remove(part)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return out
 
 
 def group_by_param_sets(psets) -> list:
@@ -937,19 +998,22 @@ def convert_one(qsv_path: str,
                      for _, off, size in indices]
         groups = group_by_param_sets(psets)
 
-    use_split  = len(groups) > 1 and mux_mode in ("auto", "split")
+    # Splitting is opt-in only.  Parameter-set fingerprints say that segments
+    # *differ*, never that each one can stand alone, and a segment that carries
+    # no parameter set of its own becomes an MP4 no decoder will open.  Guessing
+    # wrong turns one partly-playable file into several unplayable ones, so the
+    # split only happens when asked for.
+    use_split  = len(groups) > 1 and mux_mode == "split"
     use_concat = (mux_mode in ("concat", "split")
                   or (mux_mode == "auto" and bool(resets))
                   or use_split)
     if resets:
         print(f"  [note] {clock} resets at segment(s) {resets} "
               f"— each shard has its own timeline")
-    if len(groups) > 1:
-        print(f"  [note] codec parameter sets change at segment(s) "
-              f"{[g[0] for g in groups[1:]]} — one MP4 cannot describe them all")
-        if not use_split:
-            print("  [WARN] --mux-mode forces a single file; everything after "
-                  "segment 1's parameter set will decode into garbage")
+    if len(groups) > 1 and mux_mode != "split":
+        print(f"  [note] codec parameter sets differ from segment(s) "
+              f"{[g[0] for g in groups[1:]]} onward. If playback breaks there, "
+              f"try --mux-mode split; check the parts open before trusting it")
     if use_split:
         print(f"  Strategy: per-segment extract + one MP4 per parameter set "
               f"({len(groups)} parts)")
@@ -1160,6 +1224,19 @@ def inspect_qsv(qsv_path: str, deep: bool = True) -> bool:
             print(f"\n  Parameter sets introduced after segment 1: "
                   f"segment(s) {drift}")
 
+    # ── Can a decoder actually read each segment? ────────────────────────────
+    decodes = probe_decodable(qsv_path, indices) if deep else []
+    if decodes:
+        print(f"\n  Per-segment decode check (ffprobe on the first 12 MB):")
+        print(f"  {'#':>3}  {'codec':>10}  {'dimensions':>14}  {'verdict':>28}")
+        print(f"  {'-' * 3}  {'-' * 10}  {'-' * 14}  {'-' * 28}")
+        for d in decodes:
+            dims = (f"{d['width']}x{d['height']}" if d["ok"] else "—")
+            verdict = ("ok" if d["ok"]
+                       else "no codec parameters found")
+            print(f"  {d['n']:>3}  {str(d['codec'] or '—'):>10}  {dims:>14}  "
+                  f"{verdict:>28}")
+
     # ── Verdict ──────────────────────────────────────────────────────────────
     print("\n  Findings:")
     findings = []
@@ -1181,9 +1258,10 @@ def inspect_qsv(qsv_path: str, deep: bool = True) -> bool:
             )
         else:
             findings.append(
-                "all segments hold TS sync end-to-end — extraction is byte-exact, "
-                "so any playback fault is inside the elementary stream (codec "
-                "parameter sets, DRM) rather than in this tool's unpacking"
+                "all segments hold TS sync end-to-end — the 188-byte framing "
+                "survived extraction.  Note this proves the container was "
+                "unpacked right, not that the payload inside it is clear; see "
+                "the decode check for that"
             )
 
         # PID layout drift makes the demuxer follow the wrong program.  Only
@@ -1207,14 +1285,36 @@ def inspect_qsv(qsv_path: str, deep: bool = True) -> bool:
         base_ps = scans[0]["param_sets"]
         drift = [p["n"] for p, s in zip(probes[1:], scans[1:])
                  if s["param_sets"] - base_ps] if not broken else []
+        # Differing fingerprints only mean something if every segment can also
+        # stand on its own; otherwise the difference is damage, not a re-encode.
+        if decodes and not all(d["ok"] for d in decodes):
+            drift = []
         if drift:
             findings.append(
                 f"segment(s) {drift} carry codec parameter sets that segment 1 "
                 f"never had. MP4 stores these once, up front, so a plain "
                 f"stream-copy keeps only segment 1's — every later segment then "
-                f"decodes into garbage. Converting this file now writes one "
-                f"'.partN.mp4' per parameter set automatically "
-                f"(--mux-mode split forces it)"
+                f"decodes against the wrong ones. --mux-mode split writes one "
+                f"'.partN.mp4' per parameter set"
+            )
+
+    if decodes:
+        dead = [d["n"] for d in decodes if not d["ok"]]
+        if dead and len(dead) < len(decodes):
+            findings.append(
+                f"a decoder finds codec parameters in segment(s) "
+                f"{[d['n'] for d in decodes if d['ok']]} but none in "
+                f"{dead}, even though the TS framing of all of them is intact. "
+                f"The container is being unpacked correctly and the elementary "
+                f"stream inside {dead} is not readable — the payload past the "
+                f"1024-byte head is still scrambled, or is scrambled a way this "
+                f"tool does not undo. Muxing those segments on their own cannot "
+                f"work; please report this output"
+            )
+        elif dead:
+            findings.append(
+                "no segment yields codec parameters — the payload is not clear "
+                "video anywhere, so the cipher or layout does not match this file"
             )
 
     if meta["overruns"]:

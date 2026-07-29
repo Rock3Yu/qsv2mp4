@@ -70,17 +70,19 @@ allows that because it repeats the parameters in-band. Copy such a stream into
 a single MP4 and every shard after the first decodes against the wrong
 parameters: the opening minutes look fine, the remainder is garbage.
 
-There is no lossless way to put that in one MP4, so the converter writes one
-file per parameter set instead:
+There is no lossless way to put that in one MP4, so `--mux-mode split` writes
+one file per parameter set instead:
 
 ```
 movie.part1.mp4    segments 1–3
 movie.part2.mp4    segments 4–7
 ```
 
-`auto` does this on its own when it detects the change; `--mux-mode split`
-forces it, and `--mux-mode single` opts out and warns. Each part is still a
-lossless stream copy.
+This is **opt-in**, and worth understanding before reaching for it. Splitting
+only helps when every shard is independently decodable; a shard that carries no
+parameter set of its own becomes an MP4 that will not open at all. Run
+`--inspect` first — its per-segment decode check says which case you are in —
+and confirm each part plays before discarding the source.
 
 ### Examples
 
@@ -169,15 +171,16 @@ python qsv2mp4.py --inspect movie.qsv
 因为它把参数集随流反复内嵌。可一旦把这种流复制进单个 MP4，第一段之后的所有
 分段都会按错误的参数去解码：开头几分钟正常，后面全是花屏。
 
-这种情况没有无损塞进单个 MP4 的办法，所以转换器改为按参数集分文件输出：
+这种情况没有无损塞进单个 MP4 的办法，可以改用 `--mux-mode split` 按参数集分文件输出：
 
 ```
 movie.part1.mp4    分段 1–3
 movie.part2.mp4    分段 4–7
 ```
 
-`auto` 检测到参数集变化时会自动这么做；`--mux-mode split` 可强制启用，
-`--mux-mode single` 则退回单文件并给出警告。每个分片文件依然是无损流复制。
+这是**手动开关**，用之前先了解清楚：只有当每个分段都能独立解码时分文件才有意义；
+若某个分段本身不带参数集，拆出来的 MP4 会**完全打不开**。请先跑 `--inspect`，
+其中的逐段解码检查会告诉你属于哪种情况，并在删掉源文件前确认每个分片都能播放。
 
 ### 示例
 
