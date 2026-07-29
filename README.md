@@ -2,6 +2,10 @@
 
 Convert iQIYI `.qsv` offline video files to standard `.mp4` — lossless, no re-encoding.
 
+🚨 NOTE: This script only supports converting older .qsv files that are not protected by DRM encryption.
+
+🚨 注意：此脚本仅支持转换未受 DRM 加密保护的旧版 .qsv 文件。
+
 **[English](#english)** · **[中文](#中文)**
 
 ---
